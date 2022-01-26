@@ -72,7 +72,6 @@ func TestListCodespaces_limited(t *testing.T) {
 	api := API{
 		githubAPI: svr.URL,
 		client:    &http.Client{},
-		token:     "faketoken",
 	}
 	ctx := context.TODO()
 	codespaces, err := api.ListCodespaces(ctx, 200)
@@ -98,7 +97,6 @@ func TestListCodespaces_unlimited(t *testing.T) {
 	api := API{
 		githubAPI: svr.URL,
 		client:    &http.Client{},
-		token:     "faketoken",
 	}
 	ctx := context.TODO()
 	codespaces, err := api.ListCodespaces(ctx, -1)
@@ -114,5 +112,59 @@ func TestListCodespaces_unlimited(t *testing.T) {
 	}
 	if codespaces[249].Name != "codespace-249" {
 		t.Fatalf("expected codespace-249, got %s", codespaces[0].Name)
+	}
+}
+
+func TestRetries(t *testing.T) {
+	var callCount int
+	csName := "test_codespace"
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if callCount == 3 {
+			err := json.NewEncoder(w).Encode(Codespace{
+				Name: csName,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		callCount++
+		w.WriteHeader(502)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler(w, r) }))
+	t.Cleanup(srv.Close)
+	a := &API{
+		githubAPI: srv.URL,
+		client:    &http.Client{},
+	}
+	cs, err := a.GetCodespace(context.Background(), "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callCount != 3 {
+		t.Fatalf("expected at least 2 retries but got %d", callCount)
+	}
+	if cs.Name != csName {
+		t.Fatalf("expected codespace name to be %q but got %q", csName, cs.Name)
+	}
+	callCount = 0
+	handler = func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		err := json.NewEncoder(w).Encode(Codespace{
+			Name: csName,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, err = a.GetCodespace(context.Background(), "test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected no retries but got %d calls", callCount)
+	}
+	if cs.Name != csName {
+		t.Fatalf("expected codespace name to be %q but got %q", csName, cs.Name)
 	}
 }

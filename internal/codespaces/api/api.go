@@ -45,25 +45,42 @@ import (
 	"github.com/opentracing/opentracing-go"
 )
 
-const githubAPI = "https://api.github.com"
+const (
+	githubServer = "https://github.com"
+	githubAPI    = "https://api.github.com"
+	vscsAPI      = "https://online.visualstudio.com"
+)
 
 // API is the interface to the codespace service.
 type API struct {
-	token     string
-	client    httpClient
-	githubAPI string
+	client       httpClient
+	vscsAPI      string
+	githubAPI    string
+	githubServer string
+	retryBackoff time.Duration
 }
 
 type httpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// New creates a new API client with the given token and HTTP client.
-func New(token string, httpClient httpClient) *API {
+// New creates a new API client connecting to the configured endpoints with the HTTP client.
+func New(serverURL, apiURL, vscsURL string, httpClient httpClient) *API {
+	if serverURL == "" {
+		serverURL = githubServer
+	}
+	if apiURL == "" {
+		apiURL = githubAPI
+	}
+	if vscsURL == "" {
+		vscsURL = vscsAPI
+	}
 	return &API{
-		token:     token,
-		client:    httpClient,
-		githubAPI: githubAPI,
+		client:       httpClient,
+		vscsAPI:      strings.TrimSuffix(vscsURL, "/"),
+		githubAPI:    strings.TrimSuffix(apiURL, "/"),
+		githubServer: strings.TrimSuffix(serverURL, "/"),
+		retryBackoff: 100 * time.Millisecond,
 	}
 }
 
@@ -286,24 +303,24 @@ func findNextPage(linkValue string) string {
 // If the codespace is not found, an error is returned.
 // If includeConnection is true, it will return the connection information for the codespace.
 func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeConnection bool) (*Codespace, error) {
-	req, err := http.NewRequest(
-		http.MethodGet,
-		a.githubAPI+"/user/codespaces/"+codespaceName,
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-
-	if includeConnection {
-		q := req.URL.Query()
-		q.Add("internal", "true")
-		q.Add("refresh", "true")
-		req.URL.RawQuery = q.Encode()
-	}
-
-	a.setHeaders(req)
-	resp, err := a.do(ctx, req, "/user/codespaces/*")
+	resp, err := a.withRetry(func() (*http.Response, error) {
+		req, err := http.NewRequest(
+			http.MethodGet,
+			a.githubAPI+"/user/codespaces/"+codespaceName,
+			nil,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error creating request: %w", err)
+		}
+		if includeConnection {
+			q := req.URL.Query()
+			q.Add("internal", "true")
+			q.Add("refresh", "true")
+			req.URL.RawQuery = q.Encode()
+		}
+		a.setHeaders(req)
+		return a.do(ctx, req, "/user/codespaces/*")
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error making request: %w", err)
 	}
@@ -329,17 +346,18 @@ func (a *API) GetCodespace(ctx context.Context, codespaceName string, includeCon
 // StartCodespace starts a codespace for the user.
 // If the codespace is already running, the returned error from the API is ignored.
 func (a *API) StartCodespace(ctx context.Context, codespaceName string) error {
-	req, err := http.NewRequest(
-		http.MethodPost,
-		a.githubAPI+"/user/codespaces/"+codespaceName+"/start",
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-
-	a.setHeaders(req)
-	resp, err := a.do(ctx, req, "/user/codespaces/*/start")
+	resp, err := a.withRetry(func() (*http.Response, error) {
+		req, err := http.NewRequest(
+			http.MethodPost,
+			a.githubAPI+"/user/codespaces/"+codespaceName+"/start",
+			nil,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error creating request: %w", err)
+		}
+		a.setHeaders(req)
+		return a.do(ctx, req, "/user/codespaces/*/start")
+	})
 	if err != nil {
 		return fmt.Errorf("error making request: %w", err)
 	}
@@ -386,7 +404,7 @@ type getCodespaceRegionLocationResponse struct {
 
 // GetCodespaceRegionLocation returns the closest codespace location for the user.
 func (a *API) GetCodespaceRegionLocation(ctx context.Context) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, "https://online.visualstudio.com/api/v1/locations", nil)
+	req, err := http.NewRequest(http.MethodGet, a.vscsAPI+"/api/v1/locations", nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating request: %w", err)
 	}
@@ -415,8 +433,9 @@ func (a *API) GetCodespaceRegionLocation(ctx context.Context) (string, error) {
 }
 
 type Machine struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
+	Name                 string `json:"name"`
+	DisplayName          string `json:"display_name"`
+	PrebuildAvailability string `json:"prebuild_availability"`
 }
 
 // GetCodespacesMachines returns the codespaces machines for the given repo, branch and location.
@@ -460,14 +479,17 @@ func (a *API) GetCodespacesMachines(ctx context.Context, repoID int, branch, loc
 
 // CreateCodespaceParams are the required parameters for provisioning a Codespace.
 type CreateCodespaceParams struct {
-	RepositoryID              int
-	Branch, Machine, Location string
+	RepositoryID       int
+	IdleTimeoutMinutes int
+	Branch             string
+	Machine            string
+	Location           string
 }
 
 // CreateCodespace creates a codespace with the given parameters and returns a non-nil error if it
 // fails to create.
 func (a *API) CreateCodespace(ctx context.Context, params *CreateCodespaceParams) (*Codespace, error) {
-	codespace, err := a.startCreate(ctx, params.RepositoryID, params.Machine, params.Branch, params.Location)
+	codespace, err := a.startCreate(ctx, params)
 	if err != errProvisioningInProgress {
 		return codespace, err
 	}
@@ -502,10 +524,11 @@ func (a *API) CreateCodespace(ctx context.Context, params *CreateCodespaceParams
 }
 
 type startCreateRequest struct {
-	RepositoryID int    `json:"repository_id"`
-	Ref          string `json:"ref"`
-	Location     string `json:"location"`
-	Machine      string `json:"machine"`
+	RepositoryID       int    `json:"repository_id"`
+	IdleTimeoutMinutes int    `json:"idle_timeout_minutes,omitempty"`
+	Ref                string `json:"ref"`
+	Location           string `json:"location"`
+	Machine            string `json:"machine"`
 }
 
 var errProvisioningInProgress = errors.New("provisioning in progress")
@@ -514,8 +537,18 @@ var errProvisioningInProgress = errors.New("provisioning in progress")
 // It may return success or an error, or errProvisioningInProgress indicating that the operation
 // did not complete before the GitHub API's time limit for RPCs (10s), in which case the caller
 // must poll the server to learn the outcome.
-func (a *API) startCreate(ctx context.Context, repoID int, machine, branch, location string) (*Codespace, error) {
-	requestBody, err := json.Marshal(startCreateRequest{repoID, branch, location, machine})
+func (a *API) startCreate(ctx context.Context, params *CreateCodespaceParams) (*Codespace, error) {
+	if params == nil {
+		return nil, errors.New("startCreate missing parameters")
+	}
+
+	requestBody, err := json.Marshal(startCreateRequest{
+		RepositoryID:       params.RepositoryID,
+		IdleTimeoutMinutes: params.IdleTimeoutMinutes,
+		Ref:                params.Branch,
+		Location:           params.Location,
+		Machine:            params.Machine,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling request: %w", err)
 	}
@@ -620,7 +653,7 @@ func (a *API) GetCodespaceRepositoryContents(ctx context.Context, codespace *Cod
 // AuthorizedKeys returns the public keys (in ~/.ssh/authorized_keys
 // format) registered by the specified GitHub user.
 func (a *API) AuthorizedKeys(ctx context.Context, user string) ([]byte, error) {
-	url := fmt.Sprintf("https://github.com/%s.keys", user)
+	url := fmt.Sprintf("%s/%s.keys", a.githubServer, user)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -654,8 +687,21 @@ func (a *API) do(ctx context.Context, req *http.Request, spanName string) (*http
 
 // setHeaders sets the required headers for the API.
 func (a *API) setHeaders(req *http.Request) {
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
-	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+}
+
+// withRetry takes a generic function that sends an http request and retries
+// only when the returned response has a >=500 status code.
+func (a *API) withRetry(f func() (*http.Response, error)) (resp *http.Response, err error) {
+	for i := 0; i < 5; i++ {
+		resp, err = f()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 500 {
+			break
+		}
+		time.Sleep(a.retryBackoff * (time.Duration(i) + 1))
+	}
+	return resp, err
 }

@@ -78,7 +78,8 @@ type ViewOptions struct {
 	LogFailed  bool
 	Web        bool
 
-	Prompt bool
+	Prompt   bool
+	Exporter cmdutil.Exporter
 
 	Now func() time.Time
 }
@@ -155,6 +156,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	cmd.Flags().BoolVar(&opts.Log, "log", false, "View full log for either a run or specific job")
 	cmd.Flags().BoolVar(&opts.LogFailed, "log-failed", false, "View the log for any failed steps in a run or specific job")
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Open run in the browser")
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, shared.RunFields)
 
 	return cmd
 }
@@ -195,7 +197,7 @@ func runView(opts *ViewOptions) error {
 	if opts.Prompt {
 		// TODO arbitrary limit
 		opts.IO.StartProgressIndicator()
-		runs, err := shared.GetRuns(client, repo, 10)
+		runs, err := shared.GetRuns(client, repo, nil, 10)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("failed to get runs: %w", err)
@@ -226,6 +228,10 @@ func runView(opts *ViewOptions) error {
 				return err
 			}
 		}
+	}
+
+	if opts.Exporter != nil {
+		return opts.Exporter.Write(opts.IO, run)
 	}
 
 	if opts.Web {
